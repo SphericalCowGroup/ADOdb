@@ -144,6 +144,18 @@ class ADODB2_postgres extends ADODB_DataDict {
 				$sql[] = $alter . str_replace('DEFAULT '.$default,'',$v);
 				$sql[] = 'UPDATE '.$tabname.' SET '.$colname.'='.$default;
 				$sql[] = 'ALTER TABLE '.$tabname.' ALTER COLUMN '.$colname.' SET DEFAULT ' . $default;
+			}
+			// SERIAL is not a true type in PostgreSQL and is only allowed when creating a new table.
+			// See http://www.postgresql.org/docs/9.4/static/datatype-numeric.html, 8.1.4. Serial Types.
+			elseif (preg_match('/^([^ ]+) .*SERIAL/i',$v,$matches)) {
+				$colname = $matches[1];
+				$sql[] = 'CREATE SEQUENCE '.$tabname.'_'.$colname.'_seq';
+				$sql[] = $alter.$colname.' INTEGER';
+				$sql[] = 'ALTER SEQUENCE '.$tabname.'_'.$colname.'_seq OWNED BY '.$tabname.'.'.$colname;
+				$sql[] = 'UPDATE '.$tabname.' SET '.$colname.' = nextval(\''.$tabname.'_'.$colname.'_seq\')';
+				$sql[] = 'ALTER TABLE '.$tabname.' ALTER COLUMN '.$colname.' SET DEFAULT nextval(\''.$tabname.'_'.$colname.'_seq\')';
+				$sql[] = 'ALTER TABLE '.$tabname.' ALTER COLUMN '.$colname.' SET NOT NULL';
+				$not_null = false;
 			} else {
 				$sql[] = $alter . $v;
 			}
@@ -197,6 +209,24 @@ class ADODB2_postgres extends ADODB_DataDict {
 				if ($not_null = preg_match('/NOT NULL/i',$v)) {
 					$v = preg_replace('/NOT NULL/i','',$v);
 				}
+
+				// SERIAL is not a true type in PostgreSQL and is only allowed when creating a new table.
+				// See http://www.postgresql.org/docs/9.4/static/datatype-numeric.html, 8.1.4. Serial Types.
+				if (preg_match('/SERIAL/i',$v)) {
+					continue;
+				}
+
+				// Attempt to create a foreign key constraint if it does not already exist.
+				if (preg_match('/^\s*(\S+)\s*\S*\s* REFERENCES (\S+)/i',$v, $matches)) {
+					list(,$colname,$fkey) = $matches;
+					$constraint = $tabname.'_'.$colname.'_fkey';
+					if(!$this->DoesConstraintExist($constraint)) {
+						$alter = 'ALTER TABLE ' . $tabname . ' ADD CONSTRAINT '.$constraint.' FOREIGN KEY (' .$colname.') REFERENCES '.$fkey;
+						$sql[] = $alter;
+					}
+					continue;
+				}
+
 				 // this next block doesn't work - there is no way that I can see to
 				 // explicitly ask a column to be null using $flds
 				else if ($set_null = preg_match('/NULL/i',$v)) {
@@ -481,4 +511,124 @@ CREATE [ UNIQUE ] INDEX index_name ON table
 		}
 		return $ftype;
 	}
+
+	/**
+	"Florian Buzin [ easywe ]" <florian.buzin#easywe.de>
+
+	This function changes/adds new fields to your table. You don't
+	have to know if the col is new or not. It will check on its own.
+	*/
+	function changeTableSQL($tablename, $flds, $tableoptions = false, $dropOldFlds=false)
+	{
+	global $ADODB_FETCH_MODE;
+
+		$save = $ADODB_FETCH_MODE;
+		$ADODB_FETCH_MODE = ADODB_FETCH_ASSOC;
+		if ($this->connection->fetchMode !== false) $savem = $this->connection->setFetchMode(false);
+
+		// check table exists
+		$save_handler = $this->connection->raiseErrorFn;
+		$this->connection->raiseErrorFn = '';
+		$cols = $this->metaColumns($tablename);
+		$this->connection->raiseErrorFn = $save_handler;
+
+		if (isset($savem)) $this->connection->setFetchMode($savem);
+		$ADODB_FETCH_MODE = $save;
+
+		if ( empty($cols)) {
+			return $this->createTableSQL($tablename, $flds, $tableoptions);
+		}
+
+		$addedcols = array();
+		$modifiedcols = array();
+
+		if (is_array($flds)) {
+		// Cycle through the update fields, comparing
+		// existing fields to fields to update.
+		// if the Metatype and size is exactly the
+		// same, ignore - by Mark Newham
+			foreach($flds as $k=>$v) {
+				if ( isset($cols[$k]) && is_object($cols[$k]) ) {
+					// If already not allowing nulls, then don't change
+					$obj = $cols[$k];
+					if (isset($obj->not_null) && $obj->not_null)
+						$v = str_replace('NOT NULL','',$v);
+					if (isset($obj->auto_increment) && $obj->auto_increment && empty($v['AUTOINCREMENT']))
+						$v = str_replace('AUTOINCREMENT','',$v);
+
+					$c = $cols[$k];
+					$ml = $c->max_length;
+					$mt = $this->metaType($c->type,$ml);
+
+					if (isset($c->scale)) $sc = $c->scale;
+					else $sc = 99; // always force change if scale not known.
+
+					if ($sc == -1) $sc = false;
+					list($fsize, $fprec) = $this->_getSizePrec($v['SIZE']);
+
+					if ($ml == -1) $ml = '';
+					if ($mt == 'X') $ml = $v['SIZE'];
+					if (($mt != $v['TYPE']) || ($ml != $fsize || $sc != $fprec) || (isset($v['AUTOINCREMENT']) && $v['AUTOINCREMENT'] != $obj->auto_increment)) {
+						$modifiedcols[$k] = $v;
+					}
+				} else {
+					$addedcols[$k] = $v;
+				}
+			}
+		}
+
+
+		$sql = array();
+		$sql = $this->addColumnSQL($tablename, $addedcols);
+
+		// already exists, alter table instead
+		list($lines,$pkey,$idxs) = $this->_genFields($modifiedcols);
+		// genfields can return FALSE at times
+		if ($lines == null) $lines = array();
+
+		$holdflds = array();
+		foreach ( $lines as $id => $v ) {
+			if ( isset($cols[$id]) && is_object($cols[$id]) ) {
+
+				$flds = lens_ParseArgs($v,',');
+
+				//  We are trying to change the size of the field, if not allowed, simply ignore the request.
+				// $flds[1] holds the type, $flds[2] holds the size -postnuke addition
+				if ($flds && in_array(strtoupper(substr($flds[0][1],0,4)),$this->invalidResizeTypes4)
+				 && (isset($flds[0][2]) && is_numeric($flds[0][2]))) {
+					if ($this->debug) ADOConnection::outp(sprintf("<h3>%s cannot be changed to %s currently</h3>", $flds[0][0], $flds[0][1]));
+					#echo "<h3>$this->alterCol cannot be changed to $flds currently</h3>";
+					continue;
+	 			}
+	 			$holdflds[] = $modifiedcols[$id];
+			}
+		}
+		$modifiedcols = $holdflds;
+		$sql += $this->alterColumnSQL($tablename, $modifiedcols);
+
+		if ($dropOldFlds) {
+			$alter = 'ALTER TABLE ' . $this->tableName($tablename);
+			foreach ( $cols as $id => $v )
+				if ( !isset($lines[$id]) )
+					$sql[] = $alter . $this->dropCol . ' ' . $v->name;
+		}
+		return $sql;
+	}
+
+	/**
+	 * Whether a constraint exists.
+	 *
+	 * @param $constraint the name of the constraint
+	 * @return boolean true if constraint exists, false otherwise.
+	 */
+	function DoesConstraintExist($constraint) {
+		$rs = $this->connection->GetOne(
+			"SELECT 1 FROM pg_constraint WHERE conname = '$constraint'"
+		);
+		if (is_null($rs)) {
+			return false;
+		}
+		return true;
+	}
+
 }
